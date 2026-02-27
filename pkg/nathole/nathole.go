@@ -237,6 +237,32 @@ func MakeHole(ctx context.Context, listenConn *net.UDPConn, m *msg.NatHoleResp, 
 			}
 		}
 	}
+
+	stopResend := func() {}
+	if len(detectAddrs) > 0 {
+		resendCtx, cancelResend := context.WithCancel(ctx)
+		stopResend = cancelResend
+		go func() {
+			ticker := time.NewTicker(udpSendWaitTimeout)
+			defer ticker.Stop()
+			for attempt := uint(2); attempt <= udpRetryAttempts; attempt++ {
+				select {
+				case <-resendCtx.Done():
+					return
+				case <-ticker.C:
+					for _, detectAddr := range detectAddrs {
+						for _, conn := range listenConns {
+							if err := sendSidMessage(resendCtx, conn, m.Sid, transactionID, detectAddr, key, m.DetectBehavior.TTL); err != nil {
+								xl.Tracef("resend sid message attempt %d/%d from %s to %s error: %v", attempt, udpRetryAttempts, conn.LocalAddr(), detectAddr, err)
+							}
+						}
+					}
+				}
+			}
+		}()
+	}
+	defer stopResend()
+
 	if len(m.DetectBehavior.CandidatePorts) > 0 {
 		for _, conn := range listenConns {
 			sendSidMessageToRangePorts(ctx, conn, m.CandidateAddrs, m.DetectBehavior.CandidatePorts, sendToRangePortsFunc)
