@@ -24,7 +24,6 @@ import (
 	"strings"
 	"time"
 
-	retry "github.com/avast/retry-go/v4"
 	"github.com/fatedier/golib/pool"
 	"golang.org/x/net/ipv4"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -32,11 +31,6 @@ import (
 	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/transport"
 	"github.com/fatedier/frp/pkg/util/xlog"
-)
-
-const (
-	udpSendWaitTimeout = 1 * time.Second
-	udpRetryAttempts   = uint(5)
 )
 
 var (
@@ -237,32 +231,6 @@ func MakeHole(ctx context.Context, listenConn *net.UDPConn, m *msg.NatHoleResp, 
 			}
 		}
 	}
-
-	stopResend := func() {}
-	if len(detectAddrs) > 0 {
-		resendCtx, cancelResend := context.WithCancel(ctx)
-		stopResend = cancelResend
-		go func() {
-			ticker := time.NewTicker(udpSendWaitTimeout)
-			defer ticker.Stop()
-			for attempt := uint(2); attempt <= udpRetryAttempts; attempt++ {
-				select {
-				case <-resendCtx.Done():
-					return
-				case <-ticker.C:
-					for _, detectAddr := range detectAddrs {
-						for _, conn := range listenConns {
-							if err := sendSidMessage(resendCtx, conn, m.Sid, transactionID, detectAddr, key, m.DetectBehavior.TTL); err != nil {
-								xl.Tracef("resend sid message attempt %d/%d from %s to %s error: %v", attempt, udpRetryAttempts, conn.LocalAddr(), detectAddr, err)
-							}
-						}
-					}
-				}
-			}
-		}()
-	}
-	defer stopResend()
-
 	if len(m.DetectBehavior.CandidatePorts) > 0 {
 		for _, conn := range listenConns {
 			sendSidMessageToRangePorts(ctx, conn, m.CandidateAddrs, m.DetectBehavior.CandidatePorts, sendToRangePortsFunc)
@@ -324,63 +292,43 @@ func waitDetectMessage(
 	timeout time.Duration, role string,
 ) (*net.UDPAddr, error) {
 	xl := xlog.FromContextSafe(ctx)
-	_ = timeout
+	for {
+		buf := pool.GetBuf(1024)
+		_ = conn.SetReadDeadline(time.Now().Add(timeout))
+		n, raddr, err := conn.ReadFromUDP(buf)
+		_ = conn.SetReadDeadline(time.Time{})
+		if err != nil {
+			return nil, err
+		}
+		xl.Debugf("get udp message local %s, from %s", conn.LocalAddr(), raddr)
+		var m msg.NatHoleSid
+		if err := DecodeMessageInto(buf[:n], key, &m); err != nil {
+			xl.Warnf("decode sid message error: %v", err)
+			continue
+		}
+		pool.PutBuf(buf)
 
-	var result *net.UDPAddr
-	err := retry.Do(
-		func() error {
-			buf := pool.GetBuf(1024)
-			defer pool.PutBuf(buf)
+		if m.Sid != sid {
+			xl.Warnf("get sid message with wrong sid: %s, expect: %s", m.Sid, sid)
+			continue
+		}
 
-			_ = conn.SetReadDeadline(time.Now().Add(udpSendWaitTimeout))
-			n, raddr, err := conn.ReadFromUDP(buf)
-			_ = conn.SetReadDeadline(time.Time{})
+		if !m.Response {
+			// only wait for response messages if we are a sender
+			if role == DetectRoleSender {
+				continue
+			}
+
+			m.Response = true
+			buf2, err := EncodeMessage(&m, key)
 			if err != nil {
-				return err
+				xl.Warnf("encode sid message error: %v", err)
+				continue
 			}
-
-			xl.Debugf("get udp message local %s, from %s", conn.LocalAddr(), raddr)
-			var m msg.NatHoleSid
-			if err := DecodeMessageInto(buf[:n], key, &m); err != nil {
-				xl.Warnf("decode sid message error: %v", err)
-				return err
-			}
-			if m.Sid != sid {
-				err := fmt.Errorf("get sid message with wrong sid: %s, expect: %s", m.Sid, sid)
-				xl.Warnf("%v", err)
-				return err
-			}
-
-			if !m.Response {
-				// only wait for response messages if we are a sender
-				if role == DetectRoleSender {
-					return fmt.Errorf("sid message is not response yet")
-				}
-
-				m.Response = true
-				buf2, err := EncodeMessage(&m, key)
-				if err != nil {
-					xl.Warnf("encode sid message error: %v", err)
-					return err
-				}
-				_ = conn.SetWriteDeadline(time.Now().Add(udpSendWaitTimeout))
-				_, err = conn.WriteToUDP(buf2, raddr)
-				_ = conn.SetWriteDeadline(time.Time{})
-				if err != nil {
-					return err
-				}
-			}
-
-			result = raddr
-			return nil
-		},
-		retry.Attempts(udpRetryAttempts),
-		retry.Context(ctx),
-	)
-	if err != nil {
-		return nil, err
+			_, _ = conn.WriteToUDP(buf2, raddr)
+		}
+		return raddr, nil
 	}
-	return result, nil
 }
 
 func sendSidMessage(
@@ -429,16 +377,7 @@ func sendSidMessage(
 		}
 	}
 
-	if err := retry.Do(
-		func() error {
-			_ = conn.SetWriteDeadline(time.Now().Add(udpSendWaitTimeout))
-			_, err := conn.WriteToUDP(buf, raddr)
-			_ = conn.SetWriteDeadline(time.Time{})
-			return err
-		},
-		retry.Attempts(udpRetryAttempts),
-		retry.Context(ctx),
-	); err != nil {
+	if _, err := conn.WriteToUDP(buf, raddr); err != nil {
 		return err
 	}
 	return nil
