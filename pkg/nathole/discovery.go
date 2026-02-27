@@ -19,10 +19,12 @@ import (
 	"net"
 	"time"
 
+	"github.com/avast/retry-go/v4"
 	"github.com/pion/stun/v2"
 )
 
-var responseTimeout = 3 * time.Second
+var responseTimeout = 1 * time.Second
+var maxRetry uint = 10
 
 type Message struct {
 	Body []byte
@@ -110,6 +112,16 @@ func (c *discoverConn) readLoop() {
 }
 
 func (c *discoverConn) doSTUNRequest(addr string) (*stunResponse, error) {
+	rsp, err := retry.DoWithData(func() (*stunResponse, error) {
+		return c.doSTUNRequestOnce(addr)
+	}, retry.Attempts(maxRetry))
+	if err != nil {
+		return nil, err
+	}
+	return rsp, nil
+}
+
+func (c *discoverConn) doSTUNRequestOnce(addr string) (*stunResponse, error) {
 	serverAddr, err := net.ResolveUDPAddr("udp4", addr)
 	if err != nil {
 		return nil, err
