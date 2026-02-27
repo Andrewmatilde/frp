@@ -24,6 +24,7 @@ import (
 	"strings"
 	"time"
 
+	retry "github.com/avast/retry-go/v4"
 	"github.com/fatedier/golib/pool"
 	"golang.org/x/net/ipv4"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -31,6 +32,11 @@ import (
 	"github.com/fatedier/frp/pkg/msg"
 	"github.com/fatedier/frp/pkg/transport"
 	"github.com/fatedier/frp/pkg/util/xlog"
+)
+
+const (
+	udpSendWaitTimeout = 1 * time.Second
+	udpRetryAttempts   = uint(5)
 )
 
 var (
@@ -292,43 +298,63 @@ func waitDetectMessage(
 	timeout time.Duration, role string,
 ) (*net.UDPAddr, error) {
 	xl := xlog.FromContextSafe(ctx)
-	for {
-		buf := pool.GetBuf(1024)
-		_ = conn.SetReadDeadline(time.Now().Add(timeout))
-		n, raddr, err := conn.ReadFromUDP(buf)
-		_ = conn.SetReadDeadline(time.Time{})
-		if err != nil {
-			return nil, err
-		}
-		xl.Debugf("get udp message local %s, from %s", conn.LocalAddr(), raddr)
-		var m msg.NatHoleSid
-		if err := DecodeMessageInto(buf[:n], key, &m); err != nil {
-			xl.Warnf("decode sid message error: %v", err)
-			continue
-		}
-		pool.PutBuf(buf)
+	_ = timeout
 
-		if m.Sid != sid {
-			xl.Warnf("get sid message with wrong sid: %s, expect: %s", m.Sid, sid)
-			continue
-		}
+	var result *net.UDPAddr
+	err := retry.Do(
+		func() error {
+			buf := pool.GetBuf(1024)
+			defer pool.PutBuf(buf)
 
-		if !m.Response {
-			// only wait for response messages if we are a sender
-			if role == DetectRoleSender {
-				continue
-			}
-
-			m.Response = true
-			buf2, err := EncodeMessage(&m, key)
+			_ = conn.SetReadDeadline(time.Now().Add(udpSendWaitTimeout))
+			n, raddr, err := conn.ReadFromUDP(buf)
+			_ = conn.SetReadDeadline(time.Time{})
 			if err != nil {
-				xl.Warnf("encode sid message error: %v", err)
-				continue
+				return err
 			}
-			_, _ = conn.WriteToUDP(buf2, raddr)
-		}
-		return raddr, nil
+
+			xl.Debugf("get udp message local %s, from %s", conn.LocalAddr(), raddr)
+			var m msg.NatHoleSid
+			if err := DecodeMessageInto(buf[:n], key, &m); err != nil {
+				xl.Warnf("decode sid message error: %v", err)
+				return err
+			}
+			if m.Sid != sid {
+				err := fmt.Errorf("get sid message with wrong sid: %s, expect: %s", m.Sid, sid)
+				xl.Warnf("%v", err)
+				return err
+			}
+
+			if !m.Response {
+				// only wait for response messages if we are a sender
+				if role == DetectRoleSender {
+					return fmt.Errorf("sid message is not response yet")
+				}
+
+				m.Response = true
+				buf2, err := EncodeMessage(&m, key)
+				if err != nil {
+					xl.Warnf("encode sid message error: %v", err)
+					return err
+				}
+				_ = conn.SetWriteDeadline(time.Now().Add(udpSendWaitTimeout))
+				_, err = conn.WriteToUDP(buf2, raddr)
+				_ = conn.SetWriteDeadline(time.Time{})
+				if err != nil {
+					return err
+				}
+			}
+
+			result = raddr
+			return nil
+		},
+		retry.Attempts(udpRetryAttempts),
+		retry.Context(ctx),
+	)
+	if err != nil {
+		return nil, err
 	}
+	return result, nil
 }
 
 func sendSidMessage(
@@ -377,7 +403,16 @@ func sendSidMessage(
 		}
 	}
 
-	if _, err := conn.WriteToUDP(buf, raddr); err != nil {
+	if err := retry.Do(
+		func() error {
+			_ = conn.SetWriteDeadline(time.Now().Add(udpSendWaitTimeout))
+			_, err := conn.WriteToUDP(buf, raddr)
+			_ = conn.SetWriteDeadline(time.Time{})
+			return err
+		},
+		retry.Attempts(udpRetryAttempts),
+		retry.Context(ctx),
+	); err != nil {
 		return err
 	}
 	return nil

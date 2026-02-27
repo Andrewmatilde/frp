@@ -4,6 +4,7 @@ go 1.24.0
 
 require (
 	github.com/armon/go-socks5 v0.0.0-20160902184237-e75332964ef5
+	github.com/avast/retry-go/v4 v4.7.0
 	github.com/coreos/go-oidc/v3 v3.14.1
 	github.com/fatedier/golib v0.5.1
 	github.com/google/uuid v1.6.0
@@ -22,7 +23,7 @@ require (
 	github.com/songgao/water v0.0.0-20200317203138-2b4b6d7c09d8
 	github.com/spf13/cobra v1.8.0
 	github.com/spf13/pflag v1.0.5
-	github.com/stretchr/testify v1.10.0
+	github.com/stretchr/testify v1.11.1
 	github.com/tidwall/gjson v1.17.1
 	github.com/vishvananda/netlink v1.3.0
 	github.com/xtaci/kcp-go/v5 v5.6.13
